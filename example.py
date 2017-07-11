@@ -1,13 +1,15 @@
 #coding: utf-8
 from lorm import Hub
 import datetime
+import time
+import pymysql
 
 if __name__ == '__main__':
     "test"
-    db = Hub()
+    db = Hub(pymysql)
     # master db connection
-    db.add_pool('default', host='192.168.0.130', port=3306, user='dba_user', 
-                passwd='tbkt123456', db='test', charset='utf8', autocommit=True,
+    db.add_pool('default', host='192.168.1.110', port=3306, user='root', 
+                passwd='1', db='test', charset='utf8', autocommit=True,
                 pool_size=8, wait_timeout=30)
     # slave db connection
     db.add_pool('slave', host='192.168.0.130', port=3306, user='dba_user', 
@@ -90,6 +92,10 @@ if __name__ == '__main__':
     #print db.default.auth_user.create(id=10, username='13500000000xs', real_name='斑马')
     # >>> 10
 
+    # insert ... on duplicate
+    #print db.slave.auth_user.ondup(logins=1).create(username='super')
+    print db.slave.auth_user.ondup(logins=2).bulk_create([{'username':'super'}, {'username':'13607660526js'}])
+
     # bulk insert
     #users = [{'username':'13500000011xs', 'real_name':'仙人掌'}, 
     #         {'username':'13500000012xs', 'real_name':'仙人球'}]
@@ -123,3 +129,16 @@ if __name__ == '__main__':
 
     # is connection alive?
     #print db.default.open
+
+    # test reconnect
+    # c = db.slave
+    # print c.auth_user.get(id=1).id
+    # # turn off networking
+    # time.sleep(5)
+    # try:
+    #     print c.auth_user.get(id=1).id
+    # except:
+    #     print 'broken'
+    # # turn on networking
+    # time.sleep(10)
+    # print c.auth_user.get(id=1).id

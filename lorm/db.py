@@ -47,16 +47,20 @@ class Struct(dict):
         return id(self)
 
 
-class ExecuteLock:
+class Executer:
     def __init__(self, proxy):
         self.p = proxy
         self.c = proxy.connect()
+        self.cursor = None
 
     def __enter__(self):
         self.c._lock.acquire()
-        return self.c
+        self.cursor = self.c.cursor()
+        return self.cursor
 
     def __exit__(self, exc, value, tb):
+        self.p.last_executed = getattr(self.cursor, '_last_executed', None)
+        self.cursor.close()
         self.c._lock.release()
         if not self.p.transacting and self.p.get_autocommit():
             self.p.close()
@@ -67,6 +71,7 @@ class ConnectionProxy:
         self.creator = creator
         self.c = None
         self.transacting = False
+        self.last_executed = None
 
     def connect(self):
         if self.c:
@@ -120,36 +125,28 @@ class ConnectionProxy:
         self.c.rollback()
 
     def fetchall(self, sql, args=None):
-        with ExecuteLock(self) as c:
-            cursor = c.cursor()
+        with Executer(self) as cursor:
             cursor.execute(sql, args)
             rows = cursor.fetchall()
-            cursor.close()
         return rows
 
     def fetchone(self, sql, args=None):
-        with ExecuteLock(self) as c:
-            cursor = c.cursor()
+        with Executer(self) as cursor:
             cursor.execute(sql, args)
             row = cursor.fetchone()
-            cursor.close()
         return row
 
     def fetchall_dict(self, sql, args=None):
-        with ExecuteLock(self) as c:
-            cursor = c.cursor()
+        with Executer(self) as cursor:
             cursor.execute(sql, args)
             fields = [r[0] for r in cursor.description]
             rows = cursor.fetchall()
-            cursor.close()
         return [Struct(zip(fields,row)) for row in rows]
 
     def fetchone_dict(self, sql, args=None):
-        with ExecuteLock(self) as c:
-            cursor = c.cursor()
+        with Executer(self) as cursor:
             cursor.execute(sql, args)
             row = cursor.fetchone()
-            cursor.close()
         if not row:
             return
         fields = [r[0] for r in cursor.description]
@@ -159,29 +156,23 @@ class ConnectionProxy:
         """
         Returns affected rows and lastrowid.
         """
-        with ExecuteLock(self) as c:
-            cursor = c.cursor()
+        with Executer(self) as cursor:
             cursor.execute(sql, args)
-            cursor.close()
         return cursor.rowcount, cursor.lastrowid
 
     def execute_many(self, sql, args=None):
         """
         Execute a multi-row query. Returns affected rows.
         """
-        with ExecuteLock(self) as c:
-            cursor = c.cursor()
+        with Executer(self) as cursor:
             rows = cursor.executemany(sql, args)
-            cursor.close()
         return rows
 
     def callproc(self, procname, *args):
         """Execute stored procedure procname with args, returns result rows"""
-        with ExecuteLock(self) as c:
-            cursor = c.cursor()
+        with Executer(self) as cursor:
             cursor.callproc(procname, args)
             rows = cursor.fetchall()
-            cursor.close()
         return rows
 
     def __enter__(self):
@@ -189,6 +180,7 @@ class ConnectionProxy:
         self.transacting = True
         if self.get_autocommit():
             self.begin()
+        self.c._transacting = True
         return self
 
     def __exit__(self, exc, value, tb):
@@ -200,6 +192,7 @@ class ConnectionProxy:
                 self.commit()
         finally:
             self.transacting = False
+            self.c._transacting = False
             self.close()
 
     def __getattr__(self, table_name):
@@ -218,15 +211,22 @@ class Hub:
                     charset='utf8', autocommit=True, pool_size=8, wait_timeout=30)
     >>> db.default.auth_user.get(id=1)
 
-    :param pool_size: 连接池容量
-    :param wait_timeout: 连接最大保持时间(秒)
+    :param driver: MySQLdb or pymysql
     """
-    def __init__(self):
-        self.pool_manager = mysql_pool.PoolManager()
+    def __init__(self, driver):
+        self.pool_manager = mysql_pool.PoolManager(driver)
         self.creators = {}
 
     def add_pool(self, alias, **connect_kwargs):
+        """
+        :param pool_size: (optional)连接池容量
+        :param wait_timeout: (optional)连接最大保持时间(秒)
+        """
         def creator():
+            # Timeout before throwing an exception when connecting. 
+            # (default: 10, min: 1, max: 31536000)
+            if 'connect_timeout' not in connect_kwargs:
+                connect_kwargs['connect_timeout'] = 10
             return self.pool_manager.connect(**connect_kwargs)
         self.creators[alias] = creator
 
@@ -259,6 +259,8 @@ class QuerySet:
         self.exclude_dict = {}
         self.order_list = []
         self.group_list = []
+        self.ondup_list = []
+        self.ondup_dict = {}
         self.having = ''
         self.limits = []
         self.row_style = 0 # Element type, 0:dict, 1:2d list 2:flat list
@@ -274,7 +276,11 @@ class QuerySet:
     def escape_string(self, s):
         if isinstance(s, unicode):
             charset = self.conn.character_set_name()
-            s = s.encode(charset)
+            try:
+                s = s.encode(charset)
+            except:
+                # unknown python encoding
+                pass
         return self.conn.escape_string(s)
 
     def make_select(self, fields):
@@ -285,7 +291,7 @@ class QuerySet:
     def make_expr(self, key, v):
         "filter expression"
         row = key.split(self.LOOKUP_SEP, 1)
-        field = row[0]
+        field = "`%s`" % row[0]
         op = row[1] if len(row)>1 else ''
         if not op:
             if v is None:
@@ -507,11 +513,26 @@ class QuerySet:
     def last(self):
         return self[-1]
 
+    def ondup(self, *args, **kw):
+        """
+        MySQL feature: INSERT...ON DUPLICATE KEY UPDATE...
+        """
+        q = self.clone()
+        q.ondup_list = args
+        q.ondup_dict = kw
+        return q
+
     def create(self, ignore=False, **kw):
+        "Returns lastrowid"
         tokens = ','.join(['%s']*len(kw))
-        fields = ','.join(kw.iterkeys())
+        fields = ["`%s`"%k for k in kw.keys()]
+        fields = ','.join(fields)
         ignore_s = ' IGNORE' if ignore else ''
-        sql = "insert%s into %s (%s) values (%s)" % (ignore_s, self.table_name, fields, tokens)
+        ondup_s = ''
+        if self.ondup_list or self.ondup_dict:
+            update_fields = self.make_update_fields(self.ondup_list, self.ondup_dict)
+            ondup_s = ' ON DUPLICATE KEY UPDATE ' + update_fields
+        sql = "insert%s into %s (%s) values (%s)%s" % (ignore_s, self.table_name, fields, tokens, ondup_s)
         _, lastid = self.conn.execute(sql, kw.values())
         return lastid
 
@@ -521,9 +542,14 @@ class QuerySet:
             return
         kw = obj_list[0]
         tokens = ','.join(['%s']*len(kw))
-        fields = ','.join(kw.iterkeys())
+        fields = ["`%s`"%k for k in kw.keys()]
+        fields = ','.join(fields)
         ignore_s = ' IGNORE' if ignore else ''
-        sql = "insert%s into %s (%s) values (%s)" % (ignore_s, self.table_name, fields, tokens)
+        ondup_s = ''
+        if self.ondup_list or self.ondup_dict:
+            update_fields = self.make_update_fields(self.ondup_list, self.ondup_dict)
+            ondup_s = ' ON DUPLICATE KEY UPDATE ' + update_fields
+        sql = "insert%s into %s (%s) values (%s)%s" % (ignore_s, self.table_name, fields, tokens, ondup_s)
         args = [o.values() for o in obj_list]
         return self.conn.execute_many(sql, args)
 
@@ -549,15 +575,21 @@ class QuerySet:
         self._exists = b
         return b
 
-    def make_update_fields(self, kw):
-        return ', '.join('%s=%s'%(k,self.literal(v)) for k,v in kw.iteritems())
+    def make_update_fields(self, args=[], kw={}):
+        f1 = ', '.join(args)
+        f2 = ', '.join('`%s`=%s'%(k,self.literal(v)) for k,v in kw.iteritems())
+        if f1 and f2:
+            return f1 + ', ' + f2
+        elif f1:
+            return f1
+        return f2
 
-    def update(self, **kw):
+    def update(self, *args, **kw):
         "return affected rows"
-        if not kw:
+        if not args and not kw:
             return 0
         cond = self.make_where(self.cond_list, self.cond_dict, self.exclude_list, self.exclude_dict)
-        update_fields = self.make_update_fields(kw)
+        update_fields = self.make_update_fields(args, kw)
         sql = "update %s set %s %s" % (self.table_name, update_fields, cond)
         n, _ = self.conn.execute(sql)
         return n
